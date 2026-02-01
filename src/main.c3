@@ -9,8 +9,8 @@ fn int usage()
 
 	Generate C3 code page tables for the provided 8-bit mappings.
 
-	-s   Separate files for each mapping. Output will be written to
-	     ./output.
+	-s   Create separate files for each mapping. Output will be written to
+	    ./output.
 
 	`);
 	return 0;
@@ -18,14 +18,25 @@ fn int usage()
 
 struct Emitter
 {
+	Allocator allocator;
 	bool stdout;
 	Path code_page_path;
 	OutStream out;
+	List{String} cp_modules;
 }
 
+fn void Emitter.init(&self, Allocator allocator)
+{
+	self.allocator = allocator;
+	self.stdout = true;
+	self.cp_modules.init(allocator);
+}
+
+fn void Emitter.free(&self) => self.cp_modules.free();
+
+
 // TODO:
-// 3) add encode_len and decode_len
-// 4) handle multiple modules names
+// 1) add encode_len and decode_len
 
 fn int main(String[] args) => @pool()
 {
@@ -50,6 +61,7 @@ fn int main(String[] args) => @pool()
 	}
 
 	Emitter e;
+	e.init(tmem);
 
 	File out;
 	if (stdout)
@@ -69,7 +81,7 @@ fn int main(String[] args) => @pool()
 		{
 			core_module_path = path::temp(target_folder)!!;
 		}
-		e.code_page_path = core_module_path.tappend("codepage")!!;
+		e.code_page_path = core_module_path.tappend("codepages")!!;
 		path::mkdir(e.code_page_path, recursive: true)!!;
 
 		out = file::open_path(core_module_path.tappend("codepage.c3"), "w")!!;
@@ -99,7 +111,23 @@ fn bool? convert_mapping_file(Path current_path, bool is_dir, void* arg) => @poo
 	if (is_dir) return false; // Continue.
 
 	// Prepare code page name.
-	String cp_name = code_page_name(tmem, current_path)!;
+	String? cp_name = code_page_name(tmem, current_path);
+	if (catch cp_name) return false; // Skip file and continue.
+
+	if (e.cp_modules.contains(cp_name))
+	{
+		io::eprintf("Duplicate module found: %s\n", cp_name);
+		usz i = 2;
+		String candidate = cp_name;
+		while (e.cp_modules.contains(candidate))
+		{
+			candidate = string::tformat("%s_%d", cp_name, i);
+			i++;
+		}
+		cp_name = candidate;
+		io::eprintf("Assigning new name: %s\n", cp_name);
+	}
+	e.cp_modules.push(cp_name.copy(e.allocator));
 
 	// Set correct output stream if necessary.
 	File out;
@@ -118,14 +146,18 @@ fn bool? convert_mapping_file(Path current_path, bool is_dir, void* arg) => @poo
 	return false;
 }
 
-faultdef INVALID_MAPPING_FILENAME;
+faultdef SKIP_FILE;
 
 fn String? code_page_name(Allocator allocator, Path path) => @pool()
 {
 	String cp_name = path.basename().tcopy();
 	cp_name.convert_to_lower();
 
-	if (!cp_name.ends_with(".txt")) return INVALID_MAPPING_FILENAME~;
+	if (!cp_name.ends_with(".txt"))
+	{
+		io::eprintfn("Skipping file: %s", path.str_view());
+		return SKIP_FILE~;
+	}
 	cp_name = cp_name.strip_end(".txt");
 
 	foreach (&c : cp_name)
