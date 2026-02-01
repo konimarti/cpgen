@@ -5,10 +5,11 @@ import getopt;
 fn int usage()
 {
 	io::printfn(`
-	cpgen [ -s ] <source_directory..>
+	cpgen [ -m ] [ -s ] <source_directory..>
 
 	Generate C3 code page tables for the provided 8-bit mappings.
 
+	-m   Emit only charset mapping.
 	-s   Create a separate file for each mapping in folder ./output.
 
 	`);
@@ -19,6 +20,7 @@ struct Emitter
 {
 	Allocator allocator;
 	bool separate_files;
+	bool emit_only_mapping;
 	Path code_page_path;
 	List{String} cp_modules;
 }
@@ -36,15 +38,18 @@ fn int main(String[] args) => @pool()
 {
 
 	bool separate_files = false;
+	bool emit_only_mapping = false;
+
 	String target_folder = "output";
 
 	int optind;
-	if (try opts = getopt::getopts(tmem, args, "s", &optind))
+	if (try opts = getopt::getopts(tmem, args, "ms", &optind))
 	{
 		foreach (opt: opts)
 		{
 			switch (opt.flag)
 			{
+				case 'm': emit_only_mapping = true;
 				case 's': separate_files = true;
 			}
 		}
@@ -57,31 +62,8 @@ fn int main(String[] args) => @pool()
 	Emitter e;
 	e.init(tmem);
 	e.separate_files = separate_files;
-	if (e.separate_files)
-	{
-		// Create target directory structure
-		Path core_module_path;
-		if (!target_folder.is_absolute_path() ?? false)
-		{
-			core_module_path = path::tcwd()!!.tappend(target_folder)!!;
-		}
-		else
-		{
-			core_module_path = path::temp(target_folder)!!;
-		}
-		e.code_page_path = core_module_path.tappend("codepages")!!;
-		path::mkdir(e.code_page_path, recursive: true)!!;
-
-		// Emit core module to ./output/codepage.c3
-		File out = file::open_path(core_module_path.tappend("codepage.c3"), "w")!!;
-		e.emit_core_module(&out)!!;
-		(void)out.close();
-	}
-	else
-	{
-		// Emit core module to stdout.
-		e.emit_core_module(io::stdout())!!;
-	}
+	e.emit_only_mapping = emit_only_mapping;
+	e.prepare_core_module(target_folder)!!;
 
 	foreach (arg : args[optind..])
 	{
@@ -165,6 +147,41 @@ fn String? code_page_name(Allocator allocator, Path path) => @pool()
 		prefix = "cp";
 	}
 	return string::format(allocator, "%s%s", prefix, cp_name);
+}
+
+fn void? Emitter.prepare_core_module(&self, String target_folder)
+{
+	if (self.separate_files)
+	{
+		// Create target directory structure
+		Path core_module_path;
+		if (!target_folder.is_absolute_path() ?? false)
+		{
+			core_module_path = path::tcwd()!.tappend(target_folder)!;
+		}
+		else
+		{
+			core_module_path = path::temp(target_folder)!;
+		}
+		self.code_page_path = core_module_path.tappend("codepages")!;
+		path::mkdir(self.code_page_path, recursive: true)!;
+
+		// Emit core module to ./output/codepage.c3
+		if (!self.emit_only_mapping)
+		{
+			File out = file::open_path(core_module_path.tappend("codepage.c3"), "w")!;
+			self.emit_core_module(&out)!;
+			(void)out.close();
+		}
+	}
+	else
+	{
+		// Emit core module to stdout.
+		if (!self.emit_only_mapping)
+		{
+			self.emit_core_module(io::stdout())!;
+		}
+	}
 }
 
 fn void Emitter.emit_disclaimer(&self, OutStream out)
