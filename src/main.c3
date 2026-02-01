@@ -20,7 +20,7 @@ struct Emitter
 {
 	Allocator allocator;
 	bool separate_files;
-	bool emit_only_mapping;
+	bool emit_mapping_only;
 	Path code_page_path;
 	List{String} cp_modules;
 }
@@ -38,7 +38,7 @@ fn int main(String[] args) => @pool()
 {
 
 	bool separate_files = false;
-	bool emit_only_mapping = false;
+	bool emit_mapping_only = false;
 
 	String target_folder = "output";
 
@@ -49,7 +49,7 @@ fn int main(String[] args) => @pool()
 		{
 			switch (opt.flag)
 			{
-				case 'm': emit_only_mapping = true;
+				case 'm': emit_mapping_only = true;
 				case 's': separate_files = true;
 			}
 		}
@@ -62,7 +62,7 @@ fn int main(String[] args) => @pool()
 	Emitter e;
 	e.init(tmem);
 	e.separate_files = separate_files;
-	e.emit_only_mapping = emit_only_mapping;
+	e.emit_mapping_only = emit_mapping_only;
 	e.prepare_core_module(target_folder)!!;
 
 	foreach (arg : args[optind..])
@@ -167,19 +167,23 @@ fn void? Emitter.prepare_core_module(&self, String target_folder)
 		path::mkdir(self.code_page_path, recursive: true)!;
 
 		// Emit core module to ./output/codepage.c3
-		if (!self.emit_only_mapping)
+		if (!self.emit_mapping_only)
 		{
 			File out = file::open_path(core_module_path.tappend("codepage.c3"), "w")!;
 			self.emit_core_module(&out)!;
+			(void)out.close();
+			out = file::open_path(core_module_path.tappend("codepage_test.c3"), "w")!;
+			self.emit_test_module(&out)!;
 			(void)out.close();
 		}
 	}
 	else
 	{
 		// Emit core module to stdout.
-		if (!self.emit_only_mapping)
+		if (!self.emit_mapping_only)
 		{
 			self.emit_core_module(io::stdout())!;
+			self.emit_test_module(io::stdout())!;
 		}
 	}
 }
@@ -211,20 +215,22 @@ io::fprintfn(out, `<*
 
  The design of CodePage and the packed reverse mapping is
  conceptually similar to golang.org/x/text/encoding/charmap.
- *>`);
+ *>`)!;
 
-(void)io::fprintn(out, `module std::encoding::codepage;
+io::fprintn(out, `module std::encoding::codepage;
 import std::sort;
+
+const uint MASK @private = (1u << 24) - 1;
 
 <*
  Bidirectional mapping tables for a single‑byte code page.
 
- CodePointUtf8[256] to_utf8 is the forward map from codepage byte (0x00–0xFF)
- to its UTF‑8 sequence. The array index is the raw byte value. Each entry is a
- CodePointUtf8 with the UTF‑8 bytes and their length.
+ to_codepoint is the forward map from codepage byte (0x00–0xFF) to its UTF‑8
+ sequence. The array index is the raw byte value. Each entry is a CodePointUtf8
+ with the UTF‑8 bytes and their length.
 
- uint[256] from_utf8 is the reverse map from Unicode scalar value to codepage
- byte, stored in a compact, sorted form to keep memory usage low.
+ from_codepoint is the reverse map from Unicode scalar value to codepage byte,
+ stored in a compact, sorted form to keep memory usage low.
 
    Packing scheme:
      Each uint entry encodes both the codepage byte and the Unicode
@@ -254,10 +260,10 @@ import std::sort;
    This representation trades a small amount of per‑character CPU
    (binary search) for a very compact, cache‑friendly table.
 *>
-struct CodePage
+struct CodePageTable
 {
-    CodePointUtf8[256] to_utf8;
-    uint[256]          from_utf8;
+    CodePoint[256] to_codepoint;
+    uint[256]      from_codepoint;
 }
 
 <*
@@ -270,46 +276,46 @@ struct CodePage
  For single‑byte code pages, all mapped Unicode values are in the BMP,
  so at most 3 bytes are needed, but 4 bytes are reserved for symmetry.
 *>
-struct CodePointUtf8
+struct CodePoint
 {
 	char[4] bytes;
 	usz     len;
 }
-fn char[] CodePointUtf8.symbol(&self) @inline => self.bytes[:self.len];
+fn char[] CodePoint.symbol(&self) @inline => self.bytes[:self.len];
 
 <*
  Decode a single‑byte codepage byte buffer into a UTF‑8 string.
 
  @param [&inout] allocator : "Allocator used for the returned string buffer."
- @param [&inout] cp        : "Code page table describing the mapping for this encoding."
  @param src                : "Input byte array in the given code page."
+ @param [&inout] table     : "Code page table describing the mapping for this encoding."
  @return "String in UTF-8."
 *>
-fn String? decode_to_utf8(Allocator allocator, CodePage *cp, char[] src)
+fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table)
 {
 	DString buf = dstring::new(allocator);
+	buf.reserve(decode_len(src, table));
 	foreach (c: src)
 	{
-		buf.append_bytes(cp.to_utf8[c].symbol());
+		buf.append_bytes(table.to_codepoint[c].symbol());
 	}
 	return buf.str_view();
 }
-
-const uint MASK @private = (1u << 24) - 1;
 
 <*
  Encode a UTF‑8 string into a single‑byte code page.
 
  @param [&inout] allocator : "Allocator used for the returned String."
- @param [&inout] cp        : "Code page table describing the mapping for this encoding."
  @param src                : "Input byte array in UTF-8"
+ @param [&inout] table     : "Code page table describing the mapping for this encoding."
  @param replacement        : "Byte to emit when Unicode scalar cannot be represented in the target code page."
  @return "String in the given code page."
 *>
-fn String? encode_to_codepage(Allocator allocator, CodePage *cp, char[] src,
+fn String? encode_codepoints(Allocator allocator, char[] src, CodePageTable *table,
 	char replacement = 0x1a)
 {
 	DString buf = dstring::new(allocator);
+	buf.reserve(encode_len(src, table));
 
 	usz n = src.len;
 	for (usz i = 0; i < n;)
@@ -319,21 +325,38 @@ fn String? encode_to_codepage(Allocator allocator, CodePage *cp, char[] src,
 		Char32 codepoint = conv::utf8_to_char32(&src[i], &rem)!;
 		i += rem;
 
-		usz index = sort::binarysearch(cp.from_utf8[..], codepoint,
+		usz index = sort::binarysearch(table.from_codepoint[..], codepoint,
 		fn int(uint a, uint b){
 			return (a & MASK) - (b & MASK);
 		});
 
-		uint encoded = cp.from_utf8[index];
+		uint encoded = table.from_codepoint[index];
 		char byte = (char)(encoded >> 24);
 		uint unicode = encoded & MASK;
-		buf.append_char(unicode == (uint)codepoint ? byte: replacement);
+		buf.append_char(unicode == codepoint ? byte: replacement);
 	}
 	return buf.str_view();
 }
 
-module std::encoding::codepage_test;
+fn usz decode_len(char[] src, CodePageTable *table) @inline
+{
+	usz n;
+	foreach (c: src) n += table.to_codepoint[c].len;
+	return n;
+}
 
+fn usz encode_len(char[] src, CodePageTable *table) @inline
+{
+	return conv::utf8_codepoints((String)src);
+}
+`)!;
+}
+
+fn void? Emitter.emit_test_module(&self, OutStream out)
+{
+if (self.separate_files) self.emit_disclaimer(out);
+
+io::fprintn(out, `module std::encoding::codepage_test;
 import std::encoding::codepage::cp437;
 
 fn void test_cp437() @test
@@ -356,7 +379,8 @@ fn void test_cp437() @test
 		assert(got == (String)bytes, "cp437 encoding failed: got=%s, want=%s", got, (String)bytes);
 
 	};
-}`);
+}
+`)!;
 }
 
 <*
@@ -419,7 +443,10 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	}
 	uint[256] utf8_dec = gen_decode_table(&cps)!;
 
-	self.emit_disclaimer(out);
+	if (self.separate_files || self.emit_mapping_only)
+	{
+		self.emit_disclaimer(out);
+	}
 
 	io::fprintfn(out, "<*");
 	io::fprintfn(out, " Module containing the codepage table for %s.\n", cp_name);
@@ -428,18 +455,18 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintfn(out, "\n*>");
 	io::fprintfn(out, "module std::encoding::codepage::%s;\n", cp_name);
 	io::fprintfn(out, "fn char[]? decode(Allocator allocator, char[] bytes) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::decode_to_utf8(allocator, &%s, bytes);", cp_name);
+	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, bytes, &%s);", cp_name);
 	io::fprintfn(out, "\n}");
 	io::fprintfn(out, "fn char[]? tdecode(Allocator allocator, char[] bytes) => decode(tmem, bytes)!;\n");
 	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] bytes) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::encode_to_codepage(allocator, &%s, bytes);", cp_name);
+	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, bytes, &%s);", cp_name);
 	io::fprintfn(out, "\n}");
 	io::fprintfn(out, "fn char[]? tencode(Allocator allocator, char[] bytes) => encode(tmem, bytes)!;\n");
 
-	io::fprintfn(out, "CodePage %s @private = {", cp_name);
+	io::fprintfn(out, "CodePageTable %s @private = {", cp_name);
 
 	// Write CodePage.utf8_enc.
-	io::fprintfn(out, "\t.to_utf8 = {");
+	io::fprintfn(out, "\t.to_codepoint = {");
 	io::fprint(out, "\t")!;
 	foreach (j, cp: cps)
 	{
@@ -454,7 +481,7 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintn(out, "},")!;
 
 	// Write CodePage.utf8_dec.
-	io::fprintfn(out, "\t.from_utf8 = {");
+	io::fprintfn(out, "\t.from_codepoint = {");
 	io::fprint(out, "\t")!;
 	foreach (j, decode: utf8_dec)
 	{
