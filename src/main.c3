@@ -7,7 +7,7 @@ fn int usage()
 	io::printfn(`
 	cpgen [ -m ] [ -s ] <source_directory..>
 
-	Generate C3 code page tables for the provided 8-bit mappings.
+	Generate C3 code-page tables for the provided 8-bit mappings.
 
 	-m   Emit only charset mapping.
 	-s   Create a separate file for each mapping in folder ./output.
@@ -83,7 +83,7 @@ fn bool? convert_mapping_file(Path current_path, bool is_dir, void* arg) => @poo
 	Emitter *e = (Emitter*)arg;
 	if (is_dir) return false; // Continue.
 
-	// Prepare code page name.
+	// Prepare code-page name.
 	String? cp_name = code_page_name(tmem, current_path);
 	if (catch cp_name) return false; // Skip file and continue.
 
@@ -102,7 +102,7 @@ fn bool? convert_mapping_file(Path current_path, bool is_dir, void* arg) => @poo
 	}
 	e.cp_modules.push(cp_name.copy(e.allocator));
 
-	// Generate and emit new code page module.
+	// Generate and emit new code-page module.
 	if (e.separate_files)
 	{
 		String filename = string::tformat("%s.c3", cp_name);
@@ -200,7 +200,7 @@ fn void? Emitter.emit_core_module(&self, OutStream out) => @pool()
 self.emit_disclaimer(out);
 
 io::fprintfn(out, `<*
- Module providing generic single‑byte code page to UTF‑8 conversion.
+ Module providing generic single‑byte (8 bit) code page to UTF‑8 conversion.
 
  This module implements a compact, table‑driven approach for legacy
  8‑bit encodings (e.g. CP437, CP850, CP866, CP125x). It is designed so
@@ -209,9 +209,9 @@ io::fprintfn(out, `<*
 
  The design has two main goals:
 
- - Fast decode from codepage to UTF‑8 with a single table lookup per byte.
- - Memory‑efficient encode from UTF‑8 to codepage without a large
-   Unicode‑to‑byte array (no 64k reverse map per codepage).
+ - Fast decode from code page to UTF‑8 with a single table lookup per byte.
+ - Memory‑efficient encode from UTF‑8 to code page without a large
+   Unicode‑to‑byte array (no 64k reverse map per code page).
 
  The design of CodePageTable and the packed reverse mapping is conceptually
  similar to golang.org/x/text/encoding/charmap.
@@ -225,18 +225,18 @@ const uint MASK @private = (1u << 24) - 1;
 <*
  Bidirectional mapping tables for a single‑byte code page.
 
- to_codepoint is the forward map from codepage byte (0x00–0xFF) to its UTF‑8
+ to_codepoint is the forward map from code-page byte (0x00–0xFF) to its UTF‑8
  sequence. The array index is the raw byte value. Each entry is a CodePointUtf8
  with the UTF‑8 bytes and their length.
 
- from_codepoint is the reverse map from Unicode scalar value to codepage byte,
+ from_codepoint is the reverse map from Unicode scalar value to code-page byte,
  stored in a compact, sorted form to keep memory usage low.
 
    Packing scheme:
-     Each uint entry encodes both the codepage byte and the Unicode
+     Each uint entry encodes both the code-page byte and the Unicode
      scalar:
 
-         high 8 bits = codepage byte value (0x00–0xFF)
+         high 8 bits = code-page byte value (0x00–0xFF)
          low 24 bits = Unicode scalar value (code point)
 
      Example:
@@ -245,14 +245,14 @@ const uint MASK @private = (1u << 24) - 1;
    Ordering:
      The table is sorted by the low 24 bits (codepoint). This allows
      binary search over the Unicode scalar values without a 64k
-     reverse‑lookup table. For any given codepage, there are at most
+     reverse‑lookup table. For any given code page, there are at most
      256 mappings, so a log2(256) or ~8 step search is enough.
 
-   Usage in encoding (UTF‑8 to codepage):
+   Usage in encoding (UTF‑8 to code page):
      1. Decode one Unicode scalar from the UTF‑8 input.
      2. Binary‑search for an entry whose low 24 bits equal
         that scalar.
-     3. If found, extract the codepage byte from the high 8 bits and
+     3. If found, extract the code-page byte from the high 8 bits and
         emit it.
      4. If not found, emit a caller‑supplied replacement byte (typically
         0x1A / SUB).
@@ -284,7 +284,7 @@ struct CodePoint
 fn char[] CodePoint.symbol(&self) @inline => self.bytes[:self.len];
 
 <*
- Decode a single‑byte codepage byte buffer into a UTF‑8 string.
+ Decode a code-page byte buffer into a UTF‑8 string.
 
  @param [&inout] allocator : "Allocator used for the returned string buffer."
  @param src                : "Input byte array in the given code page."
@@ -309,9 +309,9 @@ fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table
  @param src                : "Input byte array in UTF-8"
  @param [&inout] table     : "Code page table describing the mapping for this encoding."
  @param replacement        : "Byte to emit when Unicode scalar cannot be represented in the target code page."
- @return "String in the given code page."
+ @return "Byte array in the given code page."
 *>
-fn String? encode_codepoints(Allocator allocator, char[] src, CodePageTable *table,
+fn char[]? encode_codepoints(Allocator allocator, char[] src, CodePageTable *table,
 	char replacement = 0x1a)
 {
 	DString buf = dstring::new(allocator);
@@ -373,7 +373,7 @@ fn void test_cp437() @test
 
 	@pool()
 	{
-		String got = (String)cp437::decode(tmem, bytes)!!;
+		String got = cp437::decode(tmem, bytes)!!;
 		assert(got == want, "cp437 decoding failed: got=%s, want=%s", got, want);
 		got = (String)cp437::encode(tmem, got[..])!!;
 		assert(got == (String)bytes, "cp437 encoding failed: got=%s, want=%s", got, (String)bytes);
@@ -472,14 +472,14 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintfn(out, " %s", string::join(tmem, doc_comment.array_view(), "\n "));
 	io::fprintfn(out, "\n*>");
 	io::fprintfn(out, "module std::encoding::codepage::%s;\n", cp_name);
-	io::fprintfn(out, "fn char[]? decode(Allocator allocator, char[] bytes) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, bytes, &%s);", cp_name_upper);
+	io::fprintfn(out, "fn String? decode(Allocator allocator, char[] src) @inline\n{");
+	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, src, &%s);", cp_name_upper);
 	io::fprintfn(out, "\n}");
-	io::fprintfn(out, "fn char[]? tdecode(Allocator allocator, char[] bytes) => decode(tmem, bytes)!;\n");
-	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] bytes) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, bytes, &%s);", cp_name_upper);
+	io::fprintfn(out, "fn String? tdecode(char[] src) @inline => decode(tmem, src)!;\n");
+	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] src) @inline\n{");
+	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, src, &%s);", cp_name_upper);
 	io::fprintfn(out, "\n}");
-	io::fprintfn(out, "fn char[]? tencode(Allocator allocator, char[] bytes) => encode(tmem, bytes)!;\n");
+	io::fprintfn(out, "fn char[]? tencode(char[] src) @inline => encode(tmem, src)!;\n");
 
 	io::fprintfn(out, "const CodePageTable %s @private = {", cp_name_upper);
 
