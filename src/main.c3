@@ -213,8 +213,8 @@ io::fprintfn(out, `<*
  - Memory‑efficient encode from UTF‑8 to codepage without a large
    Unicode‑to‑byte array (no 64k reverse map per codepage).
 
- The design of CodePage and the packed reverse mapping is
- conceptually similar to golang.org/x/text/encoding/charmap.
+ The design of CodePageTable and the packed reverse mapping is conceptually
+ similar to golang.org/x/text/encoding/charmap.
  *>`)!;
 
 io::fprintn(out, `module std::encoding::codepage;
@@ -430,13 +430,29 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 			case 2:
 				String byte = parts[0].trim();
 				String uni  = parts[1].trim();
-				if (!byte.len || !uni.len) break;
-				if (try plus = uni.index_of_char('+')) uni = uni[:plus];
-				if (byte.contains("+")) break;
+				if (byte.len && !uni.len) nextcase;
+				if (!byte.len || byte.contains("+"))
+				{
+					io::eprintfn("%s (pos %d): encountered "
+					"empty byte: %s", mapping.str_view(), i, byte);
+					break;
+				}
+				if (try plus = uni.index_of_char('+'))
+				{
+					io::eprintfn("%s (pos %d): stripping everything "
+					"after +: %s -> %s", mapping.str_view(),i, uni, uni[:plus]);
+					uni = uni[:plus];
+				}
 				cps[i] = { byte.to_uchar()!, uni.to_uint()! };
 			case 1:
-				if (!parts[0].trim().len) break;
-				cps[i] = { parts[0].to_uchar()!, 0x1a };
+				String byte = parts[0].trim();
+				if (!byte.len)
+				{
+					io::eprintfn("%s (pos %d): encountered "
+					"empty byte.", mapping.str_view(), i);
+					break;
+				}
+				cps[i] = { byte.to_uchar()!, 0x1a };
 		}
 		i++;
 		if (i >= 256) break;
