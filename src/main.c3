@@ -1,5 +1,5 @@
 module cpgen;
-import std::io, std::encoding::hex;
+import std::io, std::encoding::hex, std::collections::list;
 
 fn int usage()
 {
@@ -124,14 +124,24 @@ fn void? emit_codepage_module(Path p, OutStream out) => @pool()
 	{
 		if (!c.is_alnum()) *c = '_';
 	}
-	if (!cp_name.starts_with("cp"))
+	String prefix;
+	if (cp_name.starts_with("8859"))
 	{
-		cp_name = string::tformat("cp%s", cp_name);
+		prefix = "iso_";
 	}
+	else if (cp_name[0].is_digit())
+	{
+		prefix = "cp";
+	}
+	cp_name = string::tformat("%s%s", prefix, cp_name);
 
 	// Open file
 	File f = file::open_path(p, "r")!;
 	defer (void)f.close();
+
+	List{String} doc_comment;
+	doc_comment.tinit();
+	usz empty_comment_lines = 0;
 
 	// Read code page.
 	Codepoint[256] cps;
@@ -140,6 +150,12 @@ fn void? emit_codepage_module(Path p, OutStream out) => @pool()
 	{
 		if (try hash = line.index_of_char('#'))
 		{
+			String comment = line[hash+1..].trim();
+			if (!comment.len) empty_comment_lines++;
+			if (comment.len && empty_comment_lines < 2)
+			{
+				doc_comment.push(comment);
+			}
 			line = line[:hash];
 		}
 		if (!line.trim().len) continue;
@@ -161,9 +177,11 @@ fn void? emit_codepage_module(Path p, OutStream out) => @pool()
 		i++;
 		if (i >= 256) break;
 	}
-	// assert(i == 256, "i is %d", i);
-
-	io::fprintfn(out, "\nmodule std::encoding::codepage::%s;\n", cp_name);
+	io::fprintfn(out, "\n<*");
+	io::fprintfn(out, " Module containing the codepage table for %s.\n", cp_name);
+	io::fprintfn(out, " %s", string::join(tmem, doc_comment.array_view(), "\n "));
+	io::fprintfn(out, "\n*>");
+	io::fprintfn(out, "module std::encoding::codepage::%s;\n", cp_name);
 	io::fprintfn(out, "fn char[]? decode(Allocator allocator, char[] bytes) @inline\n{");
 	io::fprintfn(out, "\treturn codepage::decode_to_utf8(allocator, &%s, bytes);", cp_name);
 	io::fprintfn(out, "\n}");
