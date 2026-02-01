@@ -464,6 +464,8 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 		self.emit_disclaimer(out);
 	}
 
+	String cp_name_upper = cp_name.to_upper_copy(tmem);
+
 	io::fprintfn(out, "<*");
 	io::fprintfn(out, " Module containing the codepage table for %s.\n", cp_name);
 	io::fprintfn(out, " Header from the original mappings file:");
@@ -471,15 +473,15 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintfn(out, "\n*>");
 	io::fprintfn(out, "module std::encoding::codepage::%s;\n", cp_name);
 	io::fprintfn(out, "fn char[]? decode(Allocator allocator, char[] bytes) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, bytes, &%s);", cp_name);
+	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, bytes, &%s);", cp_name_upper);
 	io::fprintfn(out, "\n}");
 	io::fprintfn(out, "fn char[]? tdecode(Allocator allocator, char[] bytes) => decode(tmem, bytes)!;\n");
 	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] bytes) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, bytes, &%s);", cp_name);
+	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, bytes, &%s);", cp_name_upper);
 	io::fprintfn(out, "\n}");
 	io::fprintfn(out, "fn char[]? tencode(Allocator allocator, char[] bytes) => encode(tmem, bytes)!;\n");
 
-	io::fprintfn(out, "CodePageTable %s @private = {", cp_name);
+	io::fprintfn(out, "const CodePageTable %s @private = {", cp_name_upper);
 
 	// Write CodePage.utf8_enc.
 	io::fprintfn(out, "\t.to_codepoint = {");
