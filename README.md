@@ -59,7 +59,7 @@ The shared engine module (typically `std::encoding::codepage`) defines two struc
 struct CodePoint
 {
     char[4] bytes; // UTF‑8 bytes for a single Unicode scalar
-    usz     len;   // number of valid bytes (1–4)
+    char    len;   // number of valid bytes (1–4)
 }
 
 struct CodePageTable
