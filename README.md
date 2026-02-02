@@ -71,7 +71,7 @@ struct CodePageTable
 
 ### Packed reverse mapping (`from_codepoint`)
 
-Each `uint` entry in `from_utf8` encodes:
+Each `uint` entry in `from_codepoint` encodes:
 
 - High 8 bits: code page byte value (`0x00`–`0xFF`)
 - Low 24 bits: Unicode code point
