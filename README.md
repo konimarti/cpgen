@@ -108,10 +108,13 @@ generate one C3 module per code page and writes it to stdout.
 
 Below is a suggested flag set; adjust names to your actual implementation:
 
+- `-m`  
+  Emit the mapping module only (neither core nor test module is generated).
+
 - `-s`  
-  Generate separate files for each code-page mapping.  Write the shared core
-  module to `./output/codepage.c3` and each codepage C3 module to
-  (`./output/codepages/`).
+  Create a separate file for each mapping and save it to `./output/codepages/`.
+  Write the core and test modules into `./output/codepage.c3` and
+  `./output/codepage_test.c3`.
 
 - `-p <namespace>`  
   Module prefix for generated files (defaults to `std::encoding`).  
@@ -125,7 +128,7 @@ Below is a suggested flag set; adjust names to your actual implementation:
 import std::encoding::codepage::cp437;
 ```
 
-### Decode: CP437 → UTF‑8
+### Decode: CP437 to UTF‑8
 
 ```c3
 fn void example_decode_cp437()
@@ -143,7 +146,7 @@ fn void example_decode_cp437()
 }
 ```
 
-### Encode: UTF‑8 → CP437
+### Encode: UTF‑8 to CP437
 
 ```c3
 fn void example_encode_cp437()

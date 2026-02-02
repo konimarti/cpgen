@@ -5,12 +5,16 @@ import getopt;
 fn int usage()
 {
 	io::printfn(`
-	cpgen [ -m ] [ -s ] <source_directory..>
+	cpgen [ -m ] [ -s ] <path..>
 
-	Generate C3 code-page tables for the provided 8-bit mappings.
+	Generate C3 code-page tables for the provided mapping files.
 
-	-m   Emit only charset mapping.
-	-s   Create a separate file for each mapping in folder ./output.
+	-m   Emit charset mapping only. Neither the core nor test module is
+	     generated.
+
+	-s   Create a separate file for each mapping in './output/codepages/'
+	     and write the core and test modules into './output/codepage.c3'
+	     and './output/codepage_test.c3'.
 
 	`);
 	return 0;
@@ -200,10 +204,10 @@ fn void? Emitter.emit_core_module(&self, OutStream out) => @pool()
 self.emit_disclaimer(out);
 
 io::fprintfn(out, `<*
- Module providing generic single‑byte (8 bit) code page to UTF‑8 conversion.
+ Module providing generic single‑byte code page to UTF‑8 conversion.
 
- This module implements a compact, table‑driven approach for legacy
- 8‑bit encodings (e.g. CP437, CP850, CP866, CP125x). It is designed so
+ This module implements a compact, table‑driven approach for single-byte
+ (8‑bit) encodings (e.g. CP437, CP850, CP866, CP125x). It is designed so
  that each concrete code page only needs to supply a small, static
  mapping table; the conversion logic is shared.
 
@@ -215,6 +219,12 @@ io::fprintfn(out, `<*
 
  The design of CodePageTable and the packed reverse mapping is conceptually
  similar to golang.org/x/text/encoding/charmap.
+
+ Client code should import the desired mapping module (for example,
+ std::encoding::codepage::cp437) and invoke its decode and encode functions.
+ Each generated code page module follows this convention and exposes the same
+ high‑level interface.
+
  *>`)!;
 
 io::fprintn(out, `module std::encoding::codepage;
@@ -223,10 +233,11 @@ import std::sort;
 const uint MASK @private = (1u << 24) - 1;
 
 <*
- Bidirectional mapping tables for a single‑byte code page.
+ CodePageTable contains the bidirectional mapping tables for a single‑byte code
+ page.
 
  to_codepoint is the forward map from code-page byte (0x00–0xFF) to its UTF‑8
- sequence. The array index is the raw byte value. Each entry is a CodePointUtf8
+ sequence. The array index is the raw byte value. Each entry is a CodePoint
  with the UTF‑8 bytes and their length.
 
  from_codepoint is the reverse map from Unicode scalar value to code-page byte,
@@ -243,10 +254,10 @@ const uint MASK @private = (1u << 24) - 1;
          entry = (byte_value << 24) | codepoint;
 
    Ordering:
-     The table is sorted by the low 24 bits (codepoint). This allows
+     The table is sorted by the low 24 bits (codepoints). This allows
      binary search over the Unicode scalar values without a 64k
      reverse‑lookup table. For any given code page, there are at most
-     256 mappings, so a log2(256) or ~8 step search is enough.
+     256 mappings, so a log2(256) or 8 step search is enough.
 
    Usage in encoding (UTF‑8 to code page):
      1. Decode one Unicode scalar from the UTF‑8 input.
@@ -279,14 +290,14 @@ struct CodePageTable
 struct CodePoint
 {
 	char[4] bytes;
-	usz     len;
+	char    len;
 }
 fn char[] CodePoint.symbol(&self) @inline => self.bytes[:self.len];
 
 <*
  Decode a code-page byte buffer into a UTF‑8 string.
 
- @param [&inout] allocator : "Allocator used for the returned string buffer."
+ @param [&inout] allocator : "Allocator used for the returned string."
  @param src                : "Input byte array in the given code page."
  @param [&inout] table     : "Code page table describing the mapping for this encoding."
  @return "String in UTF-8."
@@ -305,7 +316,7 @@ fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table
 <*
  Encode a UTF‑8 string into a single‑byte code page.
 
- @param [&inout] allocator : "Allocator used for the returned String."
+ @param [&inout] allocator : "Allocator used for the returned byte array."
  @param src                : "Input byte array in UTF-8"
  @param [&inout] table     : "Code page table describing the mapping for this encoding."
  @param replacement        : "Byte to emit when Unicode scalar cannot be represented in the target code page."
@@ -384,18 +395,18 @@ fn void test_cp437() @test
 }
 
 <*
- Codepoint stores an 8-bit character in the given codepage with the equivalent
- unicode value.
+ Mapping stores an 8-bit character from the given code page with the
+ corresponding Unicode scalar.
 *>
-struct Codepoint
+struct Mapping
 {
-	char   byte;    // Character
-	uint   unicode; // Unicode
+	char   byte;    // Code-page byte.
+	uint   unicode; // Unicode scalar.
 }
 <*
- Compares the unicode values.
+ Compares two Mapppings (the Unicode scalars).
 *>
-fn bool Codepoint.less(&self, Codepoint other) => self.unicode < other.unicode;
+fn bool Mapping.less(&self, Mapping other) => self.unicode < other.unicode;
 
 fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutStream out) => @pool()
 {
@@ -408,7 +419,7 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	usz empty_comment_lines = 0;
 
 	// Read code page.
-	Codepoint[256] cps;
+	Mapping[256] cps;
 	usz i = 0;
 	while (try line = io::treadline(&f))
 	{
@@ -511,7 +522,7 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintn(out, "};\n")!;
 }
 
-fn uint[256]? gen_decode_table(Codepoint[256] *cps)
+fn uint[256]? gen_decode_table(Mapping[256] *cps)
 {
 	uint[256] dec_table;
 	// Pack the decode table (highest byte is the charset byte, the lower 3
