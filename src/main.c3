@@ -1,5 +1,5 @@
 module cpgen;
-import std::io, std::encoding::hex, std::collections::list, std::sort;
+import std::io, std::encoding, std::collections::list, std::sort;
 import getopt;
 
 fn int usage()
@@ -273,26 +273,10 @@ const uint MASK @private = (1u << 24) - 1;
 *>
 struct CodePageTable
 {
-    CodePoint[256] to_codepoint;
-    uint[256]      from_codepoint;
+    char[1280] to_codepoint;
+    uint[256]  from_codepoint;
 }
 
-<*
- UTF‑8 representation of a single code point.
-
- Each entry stores up to 4 UTF‑8 bytes in bytes and the number of
- bytes actually used in len. This avoids recomputing the UTF‑8
- encoding at runtime.
-
- For single‑byte code pages, all mapped Unicode values are in the BMP,
- so at most 3 bytes are needed, but 4 bytes are reserved for symmetry.
-*>
-struct CodePoint
-{
-	char[4] bytes;
-	char    len;
-}
-fn char[] CodePoint.symbol(&self) @inline => self.bytes[:self.len];
 
 <*
  Decode a code-page byte buffer into a UTF‑8 string.
@@ -304,11 +288,13 @@ fn char[] CodePoint.symbol(&self) @inline => self.bytes[:self.len];
 *>
 fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table)
 {
-	DString buf = dstring::new(allocator);
-	buf.reserve(decode_len(src, table));
-	foreach (c: src)
+	DString buf = dstring::new_with_capacity(allocator, decode_len(src, table));
+	usz pos, len;
+	foreach (usz c: src)
 	{
-		buf.append_bytes(table.to_codepoint[c].symbol());
+		pos = c * 5;
+		len = table.to_codepoint[pos];
+		buf.append_bytes(table.to_codepoint[pos+1:len]);
 	}
 	return buf.str_view();
 }
@@ -325,9 +311,7 @@ fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table
 fn char[]? encode_codepoints(Allocator allocator, char[] src, CodePageTable *table,
 	char replacement = 0x1a)
 {
-	DString buf = dstring::new(allocator);
-	buf.reserve(encode_len(src, table));
-
+	DString buf = dstring::new_with_capacity(allocator, encode_len(src, table));
 	usz n = src.len;
 	for (usz i = 0; i < n;)
 	{
@@ -352,7 +336,7 @@ fn char[]? encode_codepoints(Allocator allocator, char[] src, CodePageTable *tab
 fn usz decode_len(char[] src, CodePageTable *table) @inline
 {
 	usz n;
-	foreach (c: src) n += table.to_codepoint[c].len;
+	foreach (usz c: src) n += table.to_codepoint[c*5];
 	return n;
 }
 
@@ -468,7 +452,22 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 		i++;
 		if (i >= 256) break;
 	}
-	uint[256] utf8_dec = gen_decode_table(&cps)!;
+
+	i = 0;
+	char[1280] to_utf_map;
+	foreach (cp: cps)
+	{
+		char[4] utf8;
+		if (try n = conv::char32_to_utf8((Char32)cp.unicode, &utf8))
+		{
+			to_utf_map[i] = (char)n;
+			to_utf_map[i+1:4] = utf8[:4];
+		}
+		i += 5;
+	}
+	String b64 = base64::tencode(to_utf_map[..]);
+
+	uint[256] from_utf_map = gen_decode_table(&cps)!;
 
 	if (self.separate_files || self.emit_mapping_only)
 	{
@@ -495,24 +494,26 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintfn(out, "const CodePageTable %s @private = {", cp_name_upper);
 
 	// Write CodePage.utf8_enc.
-	io::fprintfn(out, "\t.to_codepoint = {");
-	io::fprint(out, "\t")!;
-	foreach (j, cp: cps)
+	// io::fprintfn(out, "\t.to_codepoint = b64`%s`,", b64);
+	io::fprint(out, "\t.to_codepoint = b64`")!;
+	i = 0;
+	usz used = 28;
+	while (i < b64.len)
 	{
-		char[4] utf8;
-		if (try n = conv::char32_to_utf8((Char32)cp.unicode, &utf8))
-		{
-			io::fprintf(out, "{ x\"%s\", %d }", hex::tencode(utf8[..]), n)!;
-			if (j < 255) io::fprintf(out, ",")!;
-		}
-		io::fprintf(out, (j+1) % 4 == 0 ? "\n\t" : " ")!;
+		usz need = 80-used;
+		usz available = b64.len-i;
+		need = available > need ? need : available;;
+		io::fprintf(out, "%s%s", i>0 ? "\t" : "", b64[i:need])!;
+		if (i+need < b64.len) io::fprint(out, "\n")!;
+		used = 8;
+		i += need;
 	}
-	io::fprintn(out, "},")!;
+	io::fprintn(out, "`,")!;
 
 	// Write CodePage.utf8_dec.
 	io::fprintfn(out, "\t.from_codepoint = {");
 	io::fprint(out, "\t")!;
-	foreach (j, decode: utf8_dec)
+	foreach (j, decode: from_utf_map)
 	{
 		io::fprintf(out, "0x%08x", decode)!;
 		if (j < 255) io::fprintf(out, ",")!;
