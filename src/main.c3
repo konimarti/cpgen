@@ -233,50 +233,49 @@ import std::sort;
 const uint MASK @private = (1u << 24) - 1;
 
 <*
+ Default replacement byte used when encoding from UTF‑8 to a single‑byte
+ code page and a Unicode scalar cannot be represented.
+
+ By convention, 0x1A is the ASCII/IBM SUB (substitute) control character.
+*>
+const char REPLACEMENT_CHAR = 0x1a;
+
+<*
  CodePageTable contains the bidirectional mapping tables for a single‑byte code
- page.
+ page in a compact packed form.
 
- to_codepoint is the forward map from code-page byte (0x00–0xFF) to its UTF‑8
- sequence. The array index is the raw byte value. Each entry is a CodePoint
- with the UTF‑8 bytes and their length.
+ to_codepoint is the forward map from code‑page byte (0x00–0xFF) to its UTF‑8
+ sequence. The array index is the raw byte value, each entry occupying 4 bytes:
 
- from_codepoint is the reverse map from Unicode scalar value to code-page byte,
- stored in a compact, sorted form to keep memory usage low.
+   - Byte 0 is the length of the UTF‑8 sequence (0–4)
+   - Bytes 1:len are the UTF‑8 bytes for the mapped Unicode scalar
 
-   Packing scheme:
-     Each uint entry encodes both the code-page byte and the Unicode
-     scalar:
+ The table therefore uses 256 * 4 bytes and is stored as a flat
+ char[1024] array, where entry i starts at offset i*4.
 
-         high 8 bits = code-page byte value (0x00–0xFF)
-         low 24 bits = Unicode scalar value (code point)
+ from_codepoint is the reverse map from Unicode scalar value to code‑page byte,
+ also stored as a packed char[1024] array. It contains 256 entries of 4 bytes
+ each, where each 4‑byte chunk is interpreted as a little‑endian uint
+ with the following packing scheme:
 
-     Example:
-         entry = (byte_value << 24) | codepoint;
+     high 8 bits = code‑page byte value (0x00–0xFF)
+     low 24 bits = Unicode scalar value (code point)
 
-   Ordering:
-     The table is sorted by the low 24 bits (codepoints). This allows
-     binary search over the Unicode scalar values without a 64k
-     reverse‑lookup table. For any given code page, there are at most
-     256 mappings, so a log2(256) or 8 step search is enough.
+ In other words:
 
-   Usage in encoding (UTF‑8 to code page):
-     1. Decode one Unicode scalar from the UTF‑8 input.
-     2. Binary‑search for an entry whose low 24 bits equal
-        that scalar.
-     3. If found, extract the code-page byte from the high 8 bits and
-        emit it.
-     4. If not found, emit a caller‑supplied replacement byte (typically
-        0x1A / SUB).
+     entry = (byte_value << 24) | codepoint;
 
-   This representation trades a small amount of per‑character CPU
-   (binary search) for a very compact, cache‑friendly table.
+ Ordering:
+   The 256 packed uint entries in from_codepoint are sorted by the low 24 bits
+   (code points). This allows binary search over Unicode scalar values without
+   a 64k reverse‑lookup table. For any given code page, there are at most
+   256 mappings, so a log2(256) or 8 step search is sufficient.
 *>
 struct CodePageTable
 {
-    char[1280] to_codepoint;
-    uint[256]  from_codepoint;
+    char[1024] to_codepoint;
+    char[1024] from_codepoint;
 }
-
 
 <*
  Decode a code-page byte buffer into a UTF‑8 string.
@@ -288,14 +287,17 @@ struct CodePageTable
 *>
 fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table)
 {
+	// Capacity hint: sum of UTF‑8 lengths per input byte.
 	DString buf = dstring::new_with_capacity(allocator, decode_len(src, table));
-	usz pos, len;
-	foreach (usz c: src)
+
+	foreach (c: src)
 	{
-		pos = c * 5;
-		len = table.to_codepoint[pos];
+		usz pos = (usz)c * 4;
+		char len = table.to_codepoint[pos];
+
 		buf.append_bytes(table.to_codepoint[pos+1:len]);
 	}
+
 	return buf.str_view();
 }
 
@@ -309,37 +311,74 @@ fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table
  @return "Byte array in the given code page."
 *>
 fn char[]? encode_codepoints(Allocator allocator, char[] src, CodePageTable *table,
-	char replacement = 0x1a)
+	char replacement = REPLACEMENT_CHAR)
 {
+	// Unpack the packed reverse table once into a local uint[256] view.
+	uint[256] from_map;
+	for (usz i = 0; i < 256; i++)
+	{
+	    UIntLE *val = (UIntLE*)&table.from_codepoint[i * 4];
+	    from_map[i] = mem::load(val, 1).val;
+	}
+
+	// Capacity hint: one output byte per Unicode scalar.
 	DString buf = dstring::new_with_capacity(allocator, encode_len(src, table));
+
 	usz n = src.len;
-	for (usz i = 0; i < n;)
+	for (usz i = 0; i < n; )
 	{
 		usz rem = n - i;
-		rem = rem < 4 ? rem : 4;
+		if (rem > 4) rem = 4;
+
 		Char32 codepoint = conv::utf8_to_char32(&src[i], &rem)!;
 		i += rem;
 
-		usz index = sort::binarysearch(table.from_codepoint[..], codepoint,
-		fn int(uint a, uint b){
-			return (a & MASK) - (b & MASK);
-		});
+		// Binary search for codepoint in low 24 bits of each entry.
+		// Returned index is between [0..from_map.len).
+		usz index = sort::binarysearch(from_map[..], (uint)codepoint,
+		    fn int(uint entry, uint cp) => (int)((entry & MASK) - cp));
 
-		uint encoded = table.from_codepoint[index];
-		char byte = (char)(encoded >> 24);
-		uint unicode = encoded & MASK;
-		buf.append_char(unicode == codepoint ? byte: replacement);
+		if (index == from_map.len)
+		{
+		    // Not found at all.
+		    buf.append_char(replacement);
+		    continue;
+		}
+
+		uint entry = from_map[index];
+		if ((entry & MASK) == (uint)codepoint)
+		{
+		    char b = (char)(entry >> 24);
+		    buf.append_char(b);
+		}
+		else
+		{
+		    buf.append_char(replacement);
+		}
 	}
+
 	return buf.str_view();
 }
 
+<*
+ Compute the number of UTF‑8 bytes produced when decoding src with the given
+ code page table.
+ @param src                : "Input byte array in the given code page."
+ @param [&inout] table     : "Code page table describing the mapping for this encoding."
+*>
 fn usz decode_len(char[] src, CodePageTable *table) @inline
 {
 	usz n;
-	foreach (usz c: src) n += table.to_codepoint[c*5];
+	foreach (usz c: src) n += table.to_codepoint[c*4];
 	return n;
 }
 
+<*
+ Compute the number of output bytes produced when
+ encoding src from UTF‑8 to a single‑byte code page.
+ @param src                : "Input byte array in UTF-8"
+ @param [&inout] table     : "Code page table describing the mapping for this encoding."
+*>
 fn usz encode_len(char[] src, CodePageTable *table) @inline
 {
 	return conv::utf8_codepoints((String)src);
@@ -361,10 +400,11 @@ fn void test_cp437() @test
                       "║  Café Menu: Crème Brûlée .... £5.00  ║"
                       "╚══════════════════════════════════════╝";
 
-	char[] bytes = x"C9CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDBB"
-		x"BA202053595354454D205354415455533A204F4B202D203235F84320F12032F843202020202020BA"
-		x"BA202043616682204D656E753A2043728A6D65204272966C8265202E2E2E2E209C352E30302020BA"
-		x"C8CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDBC";
+	char[] bytes =
+	x"C9CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDBB"
+	x"BA202053595354454D205354415455533A204F4B202D203235F84320F12032F843202020202020BA"
+	x"BA202043616682204D656E753A2043728A6D65204272966C8265202E2E2E2E209C352E30302020BA"
+	x"C8CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDBC";
 
 	@pool()
 	{
@@ -453,21 +493,33 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 		if (i >= 256) break;
 	}
 
+	// Encode to_utf_map.
 	i = 0;
-	char[1280] to_utf_map;
+	char[1024] to_utf_map;
 	foreach (cp: cps)
 	{
 		char[4] utf8;
 		if (try n = conv::char32_to_utf8((Char32)cp.unicode, &utf8))
 		{
+			assert (n != 4);
 			to_utf_map[i] = (char)n;
-			to_utf_map[i+1:4] = utf8[:4];
+			to_utf_map[i+1:3] = utf8[:3];
 		}
-		i += 5;
+		i += 4;
 	}
-	String b64 = base64::tencode(to_utf_map[..]);
+	String to_b64 = base64::tencode(to_utf_map[..]);
 
-	uint[256] from_utf_map = gen_decode_table(&cps)!;
+	// Encode from_utf_map.
+	i = 0;
+	char[1024] from_utf_map;
+	foreach (sorted_codepoint: gen_decode_table(&cps)!)
+	{
+		from_utf_map[i++] = (char)sorted_codepoint;
+		from_utf_map[i++] = (char)(sorted_codepoint>>8);
+		from_utf_map[i++] = (char)(sorted_codepoint>>16);
+		from_utf_map[i++] = (char)(sorted_codepoint>>24);
+	}
+	String from_b64 = base64::tencode(from_utf_map[..]);
 
 	if (self.separate_files || self.emit_mapping_only)
 	{
@@ -486,41 +538,47 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, src, &%s);", cp_name_upper);
 	io::fprintfn(out, "\n}");
 	io::fprintfn(out, "fn String? tdecode(char[] src) @inline => decode(tmem, src)!;\n");
-	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] src) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, src, &%s);", cp_name_upper);
+	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] src, char replacement = codepage::REPLACEMENT_CHAR) @inline\n{");
+	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, src, &%s, replacement);", cp_name_upper);
 	io::fprintfn(out, "\n}");
-	io::fprintfn(out, "fn char[]? tencode(char[] src) @inline => encode(tmem, src)!;\n");
+	io::fprintfn(out, "fn char[]? tencode(char[] src, char replacement = codepage::REPLACEMENT_CHAR) @inline => encode(tmem, src, replacement)!;\n");
 
 	io::fprintfn(out, "const CodePageTable %s @private = {", cp_name_upper);
 
 	// Write CodePage.utf8_enc.
-	// io::fprintfn(out, "\t.to_codepoint = b64`%s`,", b64);
 	io::fprint(out, "\t.to_codepoint = b64`")!;
 	i = 0;
 	usz used = 28;
-	while (i < b64.len)
+	usz n = to_b64.len;
+	while (i < n)
 	{
 		usz need = 80-used;
-		usz available = b64.len-i;
+		usz available = n-i;
 		need = available > need ? need : available;;
-		io::fprintf(out, "%s%s", i>0 ? "\t" : "", b64[i:need])!;
-		if (i+need < b64.len) io::fprint(out, "\n")!;
+		io::fprintf(out, "%s%s", i>0 ? "\t" : "", to_b64[i:need])!;
+		if (i+need < n) io::fprint(out, "\n")!;
 		used = 8;
 		i += need;
 	}
 	io::fprintn(out, "`,")!;
 
 	// Write CodePage.utf8_dec.
-	io::fprintfn(out, "\t.from_codepoint = {");
-	io::fprint(out, "\t")!;
-	foreach (j, decode: from_utf_map)
+	io::fprintf(out, "\t.from_codepoint = b64`")!;
+	i = 0;
+	used = 30;
+	n = from_b64.len;
+	while (i < n)
 	{
-		io::fprintf(out, "0x%08x", decode)!;
-		if (j < 255) io::fprintf(out, ",")!;
-		io::fprintf(out, (j+1) % 6 == 0 ? "\n\t" : " ")!;
+		usz need = 80-used;
+		usz available = n-i;
+		need = available > need ? need : available;;
+		io::fprintf(out, "%s%s", i>0 ? "\t" : "", from_b64[i:need])!;
+		if (i+need < n) io::fprint(out, "\n")!;
+		used = 8;
+		i += need;
 	}
-	io::fprintn(out, "\t}")!;
-	io::fprintn(out, "};\n")!;
+
+	io::fprintn(out, "`\n};\n")!;
 }
 
 fn uint[256]? gen_decode_table(Mapping[256] *cps)
