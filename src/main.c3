@@ -1,20 +1,32 @@
 module cpgen;
-import std::io, std::encoding, std::collections::list, std::sort;
-import getopt;
+import std::io, std::encoding, std::collections, std::sort;
+
+fn int String.compare_to(&self, String rhs)
+{
+       String lhs = *self;
+
+       usz i = 0;
+       while (i < lhs.len && i < rhs.len)
+       {
+               if (lhs[i] < rhs[i]) return -1;
+               if (lhs[i] > rhs[i]) return 1;
+               i++;
+       }
+       if (lhs.len < rhs.len) return -1;
+       if (lhs.len > rhs.len) return 1;
+       return 0;
+}
 
 fn int usage()
 {
 	io::printfn(`
-	cpgen [ -m ] [ -s ] <path..>
+	cpgen <path..>
 
 	Generate C3 code-page tables for the provided mapping files.
 
-	-m   Emit charset mapping only. Neither the core nor test module is
-	     generated.
-
-	-s   Create a separate file for each mapping in './output/codepages/'
-	     and write the core and test modules into './output/codepage.c3'
-	     and './output/codepage_test.c3'.
+	Save the public API in './output/codepage.c3', private data in
+	'/.output/codepage_private.c3', and test module in
+	'./output/codepage_test.c3'.
 
 	`);
 	return 0;
@@ -23,66 +35,66 @@ fn int usage()
 struct Emitter
 {
 	Allocator allocator;
-	bool separate_files;
-	bool emit_mapping_only;
-	Path code_page_path;
+	Path public;
+	Path private;
+	Path tests;
 	List{String} cp_modules;
+	HashMap{String, String} files;
 }
 
 fn void Emitter.init(&self, Allocator allocator)
 {
 	self.allocator = allocator;
-	self.separate_files = false;
 	self.cp_modules.init(allocator);
+	self.files.init(allocator);
 }
 
 fn void Emitter.free(&self) => self.cp_modules.free();
 
 fn int main(String[] args) => @pool()
 {
-
-	bool separate_files = false;
-	bool emit_mapping_only = false;
-
-	String target_folder = "output";
-
-	int optind;
-	if (try opts = getopt::getopts(tmem, args, "ms", &optind))
-	{
-		foreach (opt: opts)
-		{
-			switch (opt.flag)
-			{
-				case 'm': emit_mapping_only = true;
-				case 's': separate_files = true;
-			}
-		}
-	}
-	else
-	{
-		return usage();
-	}
+	Path target_folder = path::temp("output")!!;
+	path::mkdir(target_folder, recursive: true)!!;
 
 	Emitter e;
 	e.init(tmem);
-	e.separate_files = separate_files;
-	e.emit_mapping_only = emit_mapping_only;
-	e.prepare_core_module(target_folder)!!;
+	e.public  = target_folder.tappend("codepage.c3")!!;
+	e.private = target_folder.tappend("codepage_private.c3")!!;
+	e.tests   = target_folder.tappend("codepage_test.c3")!!;
 
-	foreach (arg : args[optind..])
+	foreach (arg : args[1..])
 	{
 		Path path = path::temp(arg)!!;
 		if (path::is_dir(path))
 		{
-			path.walk(&convert_mapping_file, &e)!!;
+			path.walk(&load_file_list, &e)!!;
 			continue;
 		}
-		convert_mapping_file(path, false, &e)!!;
+		load_file_list(path, false, &e)!!;
 	}
+
+	// Sort file list.
+	sort::quicksort(e.cp_modules.array_view());
+
+	// Emit core parts.
+	e.emit_core()!!;
+
+	// Convert mapping files and emit.
+	File out = file::open_path(e.private, "a")!!;
+	defer (void)out.close();
+
+	foreach (cp_name: e.cp_modules)
+	{
+		if (try current_path = e.files[cp_name])
+		{
+			e.emit_codepage_module(path::temp(current_path)!!, cp_name, &out)!!;
+		}
+	}
+
 	return 0;
 }
 
-fn bool? convert_mapping_file(Path current_path, bool is_dir, void* arg) => @pool()
+fn bool? load_file_list(Path current_path, bool is_dir, void* arg) => @pool()
 {
 	Emitter *e = (Emitter*)arg;
 	if (is_dir) return false; // Continue.
@@ -104,20 +116,14 @@ fn bool? convert_mapping_file(Path current_path, bool is_dir, void* arg) => @poo
 		cp_name = candidate;
 		io::eprintf("Assigning new name: %s\n", cp_name);
 	}
-	e.cp_modules.push(cp_name.copy(e.allocator));
+	String cp_name_cpy = cp_name.copy(e.allocator);
+	e.cp_modules.push(cp_name_cpy);
+	e.files[cp_name_cpy] = current_path.str_view().copy(e.allocator);
 
 	// Generate and emit new code-page module.
-	if (e.separate_files)
-	{
-		String filename = string::tformat("%s.c3", cp_name);
-		File out = file::open_path(e.code_page_path.tappend(filename), "w")!;
-		e.emit_codepage_module(current_path, cp_name, &out)!;
-		(void)out.close();
-	}
-	else
-	{
-		e.emit_codepage_module(current_path, cp_name, io::stdout())!;
-	}
+	// File out = file::open_path(e.private, "a")!;
+	// e.emit_codepage_module(current_path, cp_name, &out)!;
+	// (void)out.close();
 
 	return false;
 }
@@ -153,43 +159,22 @@ fn String? code_page_name(Allocator allocator, Path path) => @pool()
 	return string::format(allocator, "%s%s", prefix, cp_name);
 }
 
-fn void? Emitter.prepare_core_module(&self, String target_folder)
+fn void? Emitter.emit_core(&self)
 {
-	if (self.separate_files)
-	{
-		// Create target directory structure
-		Path core_module_path;
-		if (!target_folder.is_absolute_path() ?? false)
-		{
-			core_module_path = path::tcwd()!.tappend(target_folder)!;
-		}
-		else
-		{
-			core_module_path = path::temp(target_folder)!;
-		}
-		self.code_page_path = core_module_path.tappend("codepages")!;
-		path::mkdir(self.code_page_path, recursive: true)!;
+	File out = file::open_path(self.public, "w")!;
+	self.emit_core_module(&out)!;
+	(void)out.close();
 
-		// Emit core module to ./output/codepage.c3
-		if (!self.emit_mapping_only)
-		{
-			File out = file::open_path(core_module_path.tappend("codepage.c3"), "w")!;
-			self.emit_core_module(&out)!;
-			(void)out.close();
-			out = file::open_path(core_module_path.tappend("codepage_test.c3"), "w")!;
-			self.emit_test_module(&out)!;
-			(void)out.close();
-		}
-	}
-	else
-	{
-		// Emit core module to stdout.
-		if (!self.emit_mapping_only)
-		{
-			self.emit_core_module(io::stdout())!;
-			self.emit_test_module(io::stdout())!;
-		}
-	}
+	out = file::open_path(self.tests, "w")!;
+	self.emit_test_module(&out)!;
+	(void)out.close();
+
+	out = file::open_path(self.private, "w")!;
+	io::fprintfn(&out, "<*");
+	io::fprintfn(&out, " Private module containing the codepage table.");
+	io::fprintfn(&out, "*>");
+	io::fprintfn(&out, "module std::encoding::codepage @private;\n");
+	(void)out.close();
 }
 
 fn void Emitter.emit_disclaimer(&self, OutStream out)
@@ -276,26 +261,40 @@ struct CodePageTable
     char[1024] to_codepoint;
     char[1024] from_codepoint;
 }
+`)!;
 
-<*
+// Emit CodePage enum.
+io::fprintn(out, `<* CodePage enum *>
+enum CodePage : uint (CodePageTable *table)
+{`)!;
+foreach (cp_name: self.cp_modules)
+{
+	String cp_name_upper = cp_name.to_upper_copy(tmem);
+	io::fprintfn(out, "\t%12s = &%s,", cp_name_upper, cp_name_upper)!;
+}
+io::fprintn(out, `}
+`)!;
+
+
+io::fprintn(out, `<*
  Decode a code-page byte buffer into a UTF‑8 string.
 
  @param [&inout] allocator : "Allocator used for the returned string."
  @param src                : "Input byte array in the given code page."
- @param [&inout] table     : "Code page table describing the mapping for this encoding."
+ @param code_page          : "Code page table describing the mapping for this encoding."
  @return "String in UTF-8."
 *>
-fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table)
+fn String? decode(Allocator allocator, char[] src, CodePage code_page)
 {
 	// Capacity hint: sum of UTF‑8 lengths per input byte.
-	DString buf = dstring::new_with_capacity(allocator, decode_len(src, table));
+	DString buf = dstring::new_with_capacity(allocator, decode_len(src, code_page));
 
 	foreach (c: src)
 	{
 		usz pos = (usz)c * 4;
-		char len = table.to_codepoint[pos];
+		char len = code_page.table.to_codepoint[pos];
 
-		buf.append_bytes(table.to_codepoint[pos+1:len]);
+		buf.append_bytes(code_page.table.to_codepoint[pos+1:len]);
 	}
 
 	return buf.str_view();
@@ -306,23 +305,23 @@ fn String? decode_codepage(Allocator allocator, char[] src, CodePageTable *table
 
  @param [&inout] allocator : "Allocator used for the returned byte array."
  @param src                : "Input byte array in UTF-8"
- @param [&inout] table     : "Code page table describing the mapping for this encoding."
+ @param code_page          : "Code page table describing the mapping for this encoding."
  @param replacement        : "Byte to emit when Unicode scalar cannot be represented in the target code page."
  @return "Byte array in the given code page."
 *>
-fn char[]? encode_codepoints(Allocator allocator, char[] src, CodePageTable *table,
+fn char[]? encode(Allocator allocator, char[] src, CodePage code_page,
 	char replacement = REPLACEMENT_CHAR)
 {
 	// Unpack the packed reverse table once into a local uint[256] view.
 	uint[256] from_map;
 	for (usz i = 0; i < 256; i++)
 	{
-	    UIntLE *val = (UIntLE*)&table.from_codepoint[i * 4];
+	    UIntLE *val = (UIntLE*)&code_page.table.from_codepoint[i * 4];
 	    from_map[i] = mem::load(val, 1).val;
 	}
 
 	// Capacity hint: one output byte per Unicode scalar.
-	DString buf = dstring::new_with_capacity(allocator, encode_len(src, table));
+	DString buf = dstring::new_with_capacity(allocator, encode_len(src));
 
 	usz n = src.len;
 	for (usz i = 0; i < n; )
@@ -366,10 +365,10 @@ fn char[]? encode_codepoints(Allocator allocator, char[] src, CodePageTable *tab
  @param src                : "Input byte array in the given code page."
  @param [&inout] table     : "Code page table describing the mapping for this encoding."
 *>
-fn usz decode_len(char[] src, CodePageTable *table) @inline
+fn usz decode_len(char[] src, CodePage code_page) @inline
 {
 	usz n;
-	foreach (usz c: src) n += table.to_codepoint[c*4];
+	foreach (usz c: src) n += code_page.table.to_codepoint[c*4];
 	return n;
 }
 
@@ -377,9 +376,8 @@ fn usz decode_len(char[] src, CodePageTable *table) @inline
  Compute the number of output bytes produced when
  encoding src from UTF‑8 to a single‑byte code page.
  @param src                : "Input byte array in UTF-8"
- @param [&inout] table     : "Code page table describing the mapping for this encoding."
 *>
-fn usz encode_len(char[] src, CodePageTable *table) @inline
+fn usz encode_len(char[] src) @inline
 {
 	return conv::utf8_codepoints((String)src);
 }
@@ -388,10 +386,10 @@ fn usz encode_len(char[] src, CodePageTable *table) @inline
 
 fn void? Emitter.emit_test_module(&self, OutStream out)
 {
-if (self.separate_files) self.emit_disclaimer(out);
+	self.emit_disclaimer(out);
 
 io::fprintn(out, `module std::encoding::codepage_test;
-import std::encoding::codepage::cp437;
+import std::encoding::codepage @public;
 
 fn void test_cp437() @test
 {
@@ -408,9 +406,9 @@ fn void test_cp437() @test
 
 	@pool()
 	{
-		String got = cp437::decode(tmem, bytes)!!;
+		String got = codepage::decode(tmem, bytes, &codepage::CP437)!!;
 		assert(got == want, "cp437 decoding failed: got=%s, want=%s", got, want);
-		got = (String)cp437::encode(tmem, got[..])!!;
+		got = (String)codepage::encode(tmem, got[..], &codepage::CP437)!!;
 		assert(got == (String)bytes, "cp437 encoding failed: got=%s, want=%s", got, (String)bytes);
 
 	};
@@ -521,29 +519,25 @@ fn void? Emitter.emit_codepage_module(&self, Path mapping, String cp_name, OutSt
 	}
 	String from_b64 = base64::tencode(from_utf_map[..]);
 
-	if (self.separate_files || self.emit_mapping_only)
-	{
-		self.emit_disclaimer(out);
-	}
-
 	String cp_name_upper = cp_name.to_upper_copy(tmem);
 
 	io::fprintfn(out, "<*");
-	io::fprintfn(out, " Module containing the codepage table for %s.\n", cp_name);
+	// io::fprintfn(out, " Module containing the codepage table for %s.\n", cp_name);
 	io::fprintfn(out, " Header from the original mappings file:");
 	io::fprintfn(out, " %s", string::join(tmem, doc_comment.array_view(), "\n "));
 	io::fprintfn(out, "\n*>");
-	io::fprintfn(out, "module std::encoding::codepage::%s;\n", cp_name);
-	io::fprintfn(out, "fn String? decode(Allocator allocator, char[] src) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, src, &%s);", cp_name_upper);
-	io::fprintfn(out, "\n}");
-	io::fprintfn(out, "fn String? tdecode(char[] src) @inline => decode(tmem, src)!;\n");
-	io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] src, char replacement = codepage::REPLACEMENT_CHAR) @inline\n{");
-	io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, src, &%s, replacement);", cp_name_upper);
-	io::fprintfn(out, "\n}");
-	io::fprintfn(out, "fn char[]? tencode(char[] src, char replacement = codepage::REPLACEMENT_CHAR) @inline => encode(tmem, src, replacement)!;\n");
+	// io::fprintfn(out, "module std::encoding::codepage::%s;\n", cp_name);
+	// io::fprintfn(out, "fn String? decode(Allocator allocator, char[] src) @inline\n{");
+	// io::fprintfn(out, "\treturn codepage::decode_codepage(allocator, src, &%s);", cp_name_upper);
+	// io::fprintfn(out, "\n}");
+	// io::fprintfn(out, "fn String? tdecode(char[] src) @inline => decode(tmem, src)!;\n");
+	// io::fprintfn(out, "fn char[]? encode(Allocator allocator, char[] src, char replacement = codepage::REPLACEMENT_CHAR) @inline\n{");
+	// io::fprintfn(out, "\treturn codepage::encode_codepoints(allocator, src, &%s, replacement);", cp_name_upper);
+	// io::fprintfn(out, "\n}");
+	// io::fprintfn(out, "fn char[]? tencode(char[] src, char replacement = codepage::REPLACEMENT_CHAR) @inline => encode(tmem, src, replacement)!;\n");
 
-	io::fprintfn(out, "const CodePageTable %s @private = {", cp_name_upper);
+	// io::fprintfn(out, "const CodePageTable %s @private = {", cp_name_upper);
+	io::fprintfn(out, "const CodePageTable %s = {", cp_name_upper);
 
 	// Write CodePage.utf8_enc.
 	io::fprint(out, "\t.to_codepoint = b64`")!;
@@ -594,82 +588,4 @@ fn uint[256]? gen_decode_table(Mapping[256] *cps)
 	// decoding.
 	sort::quicksort(&dec_table, fn int(uint a, uint b){ uint mask = (1<<24)-1; return (a&mask) - (b&mask);});
 	return dec_table;
-}
-
-// getopt module implements a POSIX-compliant command-line parser.
-module getopt;
-import std::collections::list;
-
-struct Option
-{
-	char flag;
-	String arg;
-}
-
-faultdef UNKNOWN_OPTION, MISSING_ARGUMENT;
-
-<*
- Parses command-line arguments..
-
- @param [in] args : "Strings of options."
- @param [in] optstring : "Specification of options."
- @param [out] optind : "Index of the first non-option argument"
-
- @require args.len > 0
- @return "Slice of options. Allocated on heap by default."
- @return? MISSING_ARGUMENT
-
-*>
-fn Option[]? getopts(Allocator allocator, String[] args, String optstring, int *optind = null)
-{
-	int i;
-
-	List{Option} opts;
-	opts.tinit(optstring.len);
-
-	// remove program name
-	args = args[1..];
-	i++;
-
-	// parse arguments
-	while LOOP: (args.len) {
-		String arg = args[0];
-
-		switch {
-		case arg == "--":
-			i++;
-			break LOOP;
-		case arg == "-":
-			break LOOP;
-		case arg.len == 0:
-		 	break LOOP;
-		case arg[0] != '-':
-		 	break LOOP;
-		}
-
-		arg = arg[1..];
-		foreach (c : arg) {
-			usz pos = optstring.index_of_char(c)!;
-			bool hasArgument = pos+1 < optstring.len && optstring[pos+1] == ':';
-			if (hasArgument) {
-				if (args.len >= 2) {
-					args = args[1..];
-					i++;
-					opts.push({.flag=c, .arg=args[0]});
-				} else {
-					return MISSING_ARGUMENT~;
-				}
-			} else {
-				opts.push({.flag=c, .arg=""});
-			}
-		}
-		args = args[1..];
-		i++;
-	}
-
-	if (optind) {
-		*optind = i;
-	}
-
-	return opts.to_array(allocator);
 }
