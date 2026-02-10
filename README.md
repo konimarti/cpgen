@@ -1,40 +1,20 @@
 # cpgen
 
 `cpgen` is a small generator tool that converts official Unicode code page
-mapping files into C3 modules for single‑byte code page to UTF‑8 conversion.
+mapping files into C3 for single‑byte code page to UTF‑8 conversion.
 
 It produces:
 
 - A shared engine module (`std::encoding::codepage`) with generic encode/decode logic
-- One module per code page (e.g. `std::encoding::codepage::cp437`) containing the mapping tables and thin wrappers
+- A set of auto‑generated code page tables (CP437, CP850, CP866, ISO‑8859‑x, Windows‑125x, etc.)
 
 The generated code is intended for inclusion in the C3 standard library or for reuse in user projects needing legacy code page support.
+
+The implementation is table‑driven and inspired in spirit by Go’s `golang.org/x/text/encoding/charmap` package, but generated independently from the Unicode mapping files. [github](https://github.com/golang/text/blob/master/encoding/charmap/charmap.go)
 
 ## Mapping sources
 
 The `resources/` directory contains the original mapping files from the Unicode Consortium’s public “MAPPINGS” area and, optionally, other vendors.
-
-Typical layout:
-
-```
-resources/
-  vendors/
-    micsft/
-      pc/
-        CP437.TXT
-        CP850.TXT
-        CP852.TXT
-        CP863.TXT
-        CP864.TXT
-        CP866.TXT
-      windows/
-        CP1252.TXT
-        ...
-    iso8859/
-      8859-1.TXT
-      8859-2.TXT
-      ...
-```
 
 Each `.TXT` file maps one legacy code page to Unicode:
 
@@ -42,91 +22,77 @@ Each `.TXT` file maps one legacy code page to Unicode:
 - Column 2: Unicode code point in hex (`0xYYYY`)
 - Rest of line: comment (character name, etc.)
 
-`cpgen` reads these files and generates:
+## Data model and design
 
-- A 256‑entry forward table: code-page byte  UTF‑8 bytes
-- A 256‑entry packed reverse table: a `uint` with `(byte << 24) | codepoint`, sorted by `codepoint`
+### Packed code page table
 
-The generator never hard‑codes mappings; everything comes from these source
-files so updating to a newer Unicode release is just a matter of refreshing
-`resources/` and rerunning `cpgen`.
+The core type in `std::encoding::codepage` is:
 
-## Data structures and encoding approach
-
-The shared engine module (typically `std::encoding::codepage`) defines two structures:
-
-```c3
-struct CodePoint
-{
-    char[4] bytes; // UTF‑8 bytes for a single Unicode scalar
-    char    len;   // number of valid bytes (1–4)
-}
-
+```c
 struct CodePageTable
 {
-    CodePoint[256] to_codepoint;
-    uint[256]      from_codepoint; // packed reverse mapping
+    char[1024] to_codepoint;
+    char[1024] from_codepoint;
 }
 ```
 
-### Packed reverse mapping (`from_codepoint`)
+It represents one single‑byte (8‑bit) code page.
 
-Each `uint` entry in `from_codepoint` encodes:
+#### Forward table: `to_codepoint`
 
-- High 8 bits: code page byte value (`0x00`–`0xFF`)
-- Low 24 bits: Unicode code point
+Maps a code page byte to its UTF‑8 bytes:
 
-```c3
-const uint MASK = (1u << 24) - 1;
+- Indexed by the raw byte value `b` (0x00–0xFF).
+- Each entry is 4 bytes at offset `b * 4`:
 
-// Extractors
-uint  codepoint = entry & MASK;
-char  byte      = (char)(entry >> 24);
-```
+  - Byte 0: length of the UTF‑8 sequence (0–4).
+  - Bytes 1..(1+len‑1): the UTF‑8 bytes for the mapped Unicode scalar.
 
-The array is sorted by `codepoint` (low 24 bits). To map UTF‑8 to code page:
+This makes `to_codepoint` a flat `char[256 * 4]` table with one lookup per byte on decode.
 
-1. Decode one Unicode scalar from UTF‑8.
-2. Binary‑search `from_codepoint` table for a matching `codepoint`.
-3. If found, emit the stored byte.
-4. If not found, emit a caller‑provided replacement byte (typically `0x1A` / SUB).
+#### Reverse table: `from_codepoint`
 
-This avoids a 64‑KiB reverse lookup table per code page while still being efficient.
+Maps a Unicode scalar back to a code page byte:
 
-## cpgen usage
+- Stored as 256 packed 4‑byte entries in `from_codepoint`.
+- Each 4‑byte chunk is interpreted as a little‑endian `uint`:
 
-### Basic invocation
+  - High 8 bits: code page byte value (0x00–0xFF).
+  - Low 24 bits: Unicode scalar (code point).
+
+  In other words:
+
+  ```c
+  entry = (byte_value << 24) | codepoint;
+  ```
+
+- The 256 entries are sorted by the low 24 bits (`codepoint`).
+
+This allows a binary search over at most 256 entries per code page instead of
+maintaining a 64‑KiB Unicode‑to‑byte array, trading a small amount of CPU for a
+compact, cache‑friendly table.
+
+## Generator (`cpgen`) usage
+
+`cpgen` itself is a separate tool that:
+
+1. Reads mapping files from `resources/`.
+2. Builds `CodePageTable` instances for all selected code pages.
+3. Emits C3 code with:
+   - The `CodePageTable` constants (packed arrays as base64 literals).
+   - The `charset()` switch cases.
+   - Optional tests for round‑trip behavior.
+
+Typical invocation:
 
 ```bash
 cpgen ./resources
 ```
 
 This would scan all supported `.TXT` files under the input directory and
-generate one C3 module per code page and writes it to stdout.
-
-### Common flags
-
-Below is a suggested flag set; adjust names to your actual implementation:
-
-- `-m`  
-  Emit the mapping module only (neither core nor test module is generated).
-
-- `-s`  
-  Create a separate file for each mapping and save it to `./output/codepages/`.
-  Write the core and test modules into `./output/codepage.c3` and
-  `./output/codepage_test.c3`.
-
-- `-p <namespace>`  
-  Module prefix for generated files (defaults to `std::encoding`).  
-  Example: `-p myproj::encoding`. Not implemented yet.
+generate three C3 files (`codepage.c3`, `codepage_private.c3` and `codepage_test.c3`).
 
 ## Using generated code pages in user code
-
-### Importing a code page
-
-```c3
-import std::encoding::codepage::cp437;
-```
 
 ### Decode: CP437 to UTF‑8
 
@@ -138,7 +104,7 @@ fn void example_decode_cp437()
 
     @pool()
     {
-        char[] utf8 = cp437::decode(tmem, raw)!!;
+        char[] utf8 = codepage::decode(tmem, raw, codepage::charset("cp437"))!!;
 
         // utf8 now holds a UTF‑8 string with proper box‑drawing characters.
         io::printn(utf8);
@@ -155,7 +121,7 @@ fn void example_encode_cp437()
     {
         char[] banner = "╔════ C3 CP437 Test ════╗";
 
-        char[] encoded = cp437::encode(tmem, banner)!!;
+        char[] encoded = codepage::encode(tmem, banner, codepage::charset("cp437"))!!;
 
         // encoded contains CP437 bytes.
 	io::printn(encoded);
